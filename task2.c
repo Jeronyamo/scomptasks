@@ -14,6 +14,7 @@
 
 #define MY_PI 3.14159265358979323846
 //#define PRINT_U
+//#define DO_PARALLEL
 
 #ifndef TIME_UTC
 #define TIME_UTC 1
@@ -24,7 +25,7 @@ typedef double fptype;
 
 const fptype a2 = 1. / 4;
 const unsigned N1 = 128, N2 = 256, K = 20;
-const fptype tau = 1e-3, tau2 = 1e-6;
+const fptype tau = 1e-4, tau2 = 1e-8;
 
 
 struct Vec3 {
@@ -69,7 +70,7 @@ fptype deltah(unsigned i, unsigned j, unsigned k, fptype *u_n, const unsigned N,
     if (!i || !k || i == N || k == N) return 0;
     return (u_n[ind(i, (j ? j - 1 : N - 1), k, N)] + u_n[ind(i, (j < N ? j + 1 : 1), k, N)] +
             u_n[ind(i - 1, j, k, N)] + u_n[ind(i + 1, j, k, N)] +
-            u_n[ind(i, j, k - 1, N)] + u_n[ind(i, j, k + 1, N)] - 6 * u_n[ind(i, j, k, N)]) / sqrt(h2.x) * 2;
+            u_n[ind(i, j, k - 1, N)] + u_n[ind(i, j, k + 1, N)] - 6 * u_n[ind(i, j, k, N)]);
 }
 
 
@@ -105,13 +106,32 @@ void comp_all(int nMaj, int nMin, const struct Vec3 L, const unsigned N, const u
             for (unsigned k = 0u; k <= N; ++k)
                 ref0[ind(i, j, k, N)] = phi(h.x * i, h.y * j, h.z * k, L);
 
+    // U0 Error
+    #pragma omp parallel for reduction(max : maxv) num_threads(NThreads)
+    for (unsigned i = 0u; i <= N; ++i)
+        for (unsigned j = 0u; j <= N; ++j)
+            for (unsigned k = 0u; k <= N; ++k) {
+                fptype _val = fabs(ref0[ind(i, j, k, N)] - u_an(h.x * i, h.y * j, h.z * k, 0, L));
+                if (_val > maxv) maxv = _val;
+            }
+
 
     // U1
     #pragma omp parallel for collapse(3) num_threads(NThreads)
     for (unsigned i = 0u; i <= N; ++i)
         for (unsigned j = 0u; j <= N; ++j)
             for (unsigned k = 0u; k <= N; ++k)
-                ref1[ind(i, j, k, N)] = ref0[ind(i, j, k, N)] + tau2 / 2 * deltah(i, j, k, ref0, N, h2);
+                ref1[ind(i, j, k, N)] = ref0[ind(i, j, k, N)] + a2 * tau2 / 2 * deltah(i, j, k, ref0, N, h2);
+
+    // U1 Error
+    #pragma omp parallel for reduction(max : maxv) num_threads(NThreads)
+    for (unsigned i = 0u; i <= N; ++i)
+        for (unsigned j = 0u; j <= N; ++j)
+            for (unsigned k = 0u; k <= N; ++k) {
+                fptype _val = fabs(ref0[ind(i, j, k, N)] - u_an(h.x * i, h.y * j, h.z * k, tau, L));
+                if (_val > maxv) maxv = _val;
+            }
+
 
 #ifdef PRINT_U
     char buf[16];
@@ -119,23 +139,26 @@ void comp_all(int nMaj, int nMin, const struct Vec3 L, const unsigned N, const u
     sprintf(buf, "u_%c_%d.txt", L.x == 1 ? '1' : 'P', N);
     FILE *f = fopen(buf, "w");
 
-    fprintf(f, "t=0\n");
     printf("t=0\r");
-    for (unsigned i = 0u; i <= N; ++i)
-        for (unsigned j = 0u; j <= N; ++j)
-            for (unsigned k = 0u; k <= N; ++k)
-                fprintf(f, "%f\n", ref0[ind(i, j, k, N)]);
+    fprintf(f, "(");
+    for (unsigned i = 0; i < N; i += N >> 4)
+        for (unsigned j = 0; j < N; j += N >> 4)
+            for (unsigned k = 0; k < N; k += N >> 4)
+                fprintf(f, "%f,", ref0[ind(i, j, k, N)]);
+    fprintf(f, ")\n");
 
-    fprintf(f, "\nt=1\n");
     printf("t=1\r");
-    for (unsigned i = 0u; i <= N; ++i)
-        for (unsigned j = 0u; j <= N; ++j)
-            for (unsigned k = 0u; k <= N; ++k)
-                fprintf(f, "%f\n", ref1[ind(i, j, k, N)]);
+    fprintf(f, "(");
+    for (unsigned i = 0; i < N; i += N >> 4)
+        for (unsigned j = 0; j < N; j += N >> 4)
+            for (unsigned k = 0; k < N; k += N >> 4)
+                fprintf(f, "%f,", ref1[ind(i, j, k, N)]);
+    fprintf(f, ")\n");
 #endif
 
+
     // t = 2, ..., K
-    for (unsigned t = 2u; t < K; ++t) {
+    for (unsigned t = 2u; t <= K; ++t) {
         ref0 = ref + ((t - 2) % 3) * N3;
         ref1 = ref + ((t - 1) % 3) * N3;
         ref2 = ref + ((t    ) % 3) * N3;
@@ -151,26 +174,30 @@ void comp_all(int nMaj, int nMin, const struct Vec3 L, const unsigned N, const u
         for (unsigned i = 0u; i <= N; ++i)
             for (unsigned j = 0u; j <= N; ++j)
                 for (unsigned k = 0u; k <= N; ++k) {
-                    fptype _val = ref2[ind(i, j, k, N)] - u_an(h.x * i, h.y * j, h.z * k, t * tau, L);
+                    fptype _val = fabs(ref2[ind(i, j, k, N)] - u_an(h.x * i, h.y * j, h.z * k, t * tau, L));
                     if (_val > maxv) maxv = _val;
                 }
 
 #ifdef PRINT_U
-        fprintf(f, "\nt=%d\n", t);
         printf("t=%d\r", t);
-        for (unsigned i = 0u; i <= N; ++i)
-            for (unsigned j = 0u; j <= N; ++j)
-                for (unsigned k = 0u; k <= N; ++k)
-                    fprintf(f, "%f\n", ref2[ind(i, j, k, N)]);
-#endif
+        fprintf(f, "(");
+        for (unsigned i = 0; i < N; i += N >> 4)
+            for (unsigned j = 0; j < N; j += N >> 4)
+                for (unsigned k = 0; k < N; k += N >> 4)
+                    fprintf(f, "%f,", ref2[ind(i, j, k, N)]);
+        fprintf(f, ")\n");
     }
-
-    timespec_get(&finish, TIME_UTC);
-    printf("DONE, results:\n");
-    printf("Max error = %f\n", maxv);
-    printf("overall = %f\n", timediff(finish, start));
+    fclose(f);
+#else
+    }
+#endif
 
     free(ref);
+    timespec_get(&finish, TIME_UTC);
+    printf("DONE, results:\n");
+    printf("Max error = %e\n", maxv);
+    printf("overall = %f\n", timediff(finish, start));
+
     return;
 }
 
@@ -178,36 +205,49 @@ void comp_all(int nMaj, int nMin, const struct Vec3 L, const unsigned N, const u
 int main(void) {
 #ifdef PRINT_U
     FILE *f = fopen("./u_an_1_128.txt", "w");
-    for (unsigned t = 0; t < K; ++t)
-        for (unsigned i = 0; i < 128; ++i)
-            for (unsigned j = 0; j < 128; ++j)
-                for (unsigned k = 0; k < 128; ++k)
-                    fprintf(f, "%f\n", u_an((1. / 128) * i, (1. / 128) * j, (1. / 128) * k, t * tau, L1));
+    for (unsigned t = 0; t <= K; ++t) {
+        fprintf(f, "(");
+        for (unsigned i = 0; i < N1; i += N1 >> 4)
+            for (unsigned j = 0; j < N1; j += N1 >> 4)
+                for (unsigned k = 0; k < N1; k += N1 >> 4)
+                    fprintf(f, "%f,", u_an((1. / 128) * i, (1. / 128) * j, (1. / 128) * k, t * tau, L1));
+        fprintf(f, ")\n");
+    }
     fclose(f);
 
     f = fopen("./u_an_P_128.txt", "w");
-    for (unsigned t = 0; t < K; ++t)
-        for (unsigned i = 0; i < 128; ++i)
-            for (unsigned j = 0; j < 128; ++j)
-                for (unsigned k = 0; k < 128; ++k)
-                    fprintf(f, "%f\n", u_an((MY_PI / 128) * i, (MY_PI / 128) * j, (MY_PI / 128) * k, t * tau, LP));
+    for (unsigned t = 0; t <= K; ++t) {
+        fprintf(f, "(");
+        for (unsigned i = 0; i < N1; i += N1 >> 4)
+            for (unsigned j = 0; j < N1; j += N1 >> 4)
+                for (unsigned k = 0; k < N1; k += N1 >> 4)
+                    fprintf(f, "%f,", u_an((MY_PI / 128) * i, (MY_PI / 128) * j, (MY_PI / 128) * k, t * tau, LP));
+        fprintf(f, ")\n");
+    }
     fclose(f);
 
     f = fopen("./u_an_1_256.txt", "w");
-    for (unsigned t = 0; t < K; ++t)
-        for (unsigned i = 0; i < 256; ++i)
-            for (unsigned j = 0; j < 256; ++j)
-                for (unsigned k = 0; k < 256; ++k)
-                    fprintf(f, "%f\n", u_an((1. / 256) * i, (1. / 256) * j, (1. / 256) * k, t * tau, L1));
+    for (unsigned t = 0; t <= K; ++t) {
+        fprintf(f, "(");
+        for (unsigned i = 0; i < N2; i += N2 >> 4)
+            for (unsigned j = 0; j < N2; j += N2 >> 4)
+                for (unsigned k = 0; k < N2; k += N2 >> 4)
+                    fprintf(f, "%f,", u_an((1. / 256) * i, (1. / 256) * j, (1. / 256) * k, t * tau, L1));
+        fprintf(f, ")\n");
+    }
     fclose(f);
 
     f = fopen("./u_an_P_256.txt", "w");
-    for (unsigned t = 0; t < K; ++t)
-        for (unsigned i = 0; i < 256; ++i)
-            for (unsigned j = 0; j < 256; ++j)
-                for (unsigned k = 0; k < 256; ++k)
-                    fprintf(f, "%f\n", u_an((MY_PI / 256) * i, (MY_PI / 256) * j, (MY_PI / 256) * k, t * tau, LP));
+    for (unsigned t = 0; t <= K; ++t) {
+        fprintf(f, "(");
+        for (unsigned i = 0; i < N2; i += N2 >> 4)
+            for (unsigned j = 0; j < N2; j += N2 >> 4)
+                for (unsigned k = 0; k < N2; k += N2 >> 4)
+                    fprintf(f, "%f,", u_an((MY_PI / 256) * i, (MY_PI / 256) * j, (MY_PI / 256) * k, t * tau, LP));
+        fprintf(f, ")\n");
+    }
     fclose(f);
+
     comp_all(1, 4, L1, N1, 16);
     comp_all(2, 4, LP, N1, 16);
     comp_all(3, 3, L1, N2, 16);
@@ -217,24 +257,32 @@ int main(void) {
     comp_all(0, 0, L1, N1, 2);
 
     comp_all(1, 1, L1, N1, 2);
+#ifdef DO_PARALLEL
     comp_all(1, 2, L1, N1, 4);
     comp_all(1, 3, L1, N1, 8);
     comp_all(1, 4, L1, N1, 16);
+#endif
 
     comp_all(2, 1, LP, N1, 2);
+#ifdef DO_PARALLEL
     comp_all(2, 2, LP, N1, 4);
     comp_all(2, 3, LP, N1, 8);
     comp_all(2, 4, LP, N1, 16);
+#endif
 
     comp_all(3, 1, L1, N2, 4);
+#ifdef DO_PARALLEL
     comp_all(3, 2, L1, N2, 8);
     comp_all(3, 3, L1, N2, 16);
     comp_all(3, 4, L1, N2, 32);
+#endif
 
     comp_all(4, 1, LP, N2, 4);
+#ifdef DO_PARALLEL
     comp_all(4, 2, LP, N2, 8);
     comp_all(4, 3, LP, N2, 16);
     comp_all(4, 4, LP, N2, 32);
 #endif
+#endif // not def PRINT_U
     return 0;
 }
